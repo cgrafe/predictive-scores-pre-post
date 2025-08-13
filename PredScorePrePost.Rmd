@@ -1,0 +1,150 @@
+---
+title: "Predictive Risk Scores Intervention Pre-Post Analysis (Synthetic Data)"
+author: "Carl Grafe"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+  toc: true
+toc_depth: 2
+number_sections: true
+theme: flatly
+df_print: paged
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(data.table)
+library(lme4)
+library(dplyr)
+library(tidyverse)
+library(ggeffects)
+library(splines)
+```
+
+# Simulate Data
+
+## Simulate Pre-Intervention Data
+
+```{r}
+set.seed(5031)
+
+nPre <- 500
+
+fakePre_df <- data.frame(
+  PersonID = sprintf("P%05d", sample(10000:59999, nPre, replace = TRUE)),
+  InstructorID = sample(paste0("I", sprintf("%03d", 1:50)), nPre, replace = TRUE)
+)
+
+# Synthetic weekly average predictive scores generated from 1,000 draws from binomial 
+# distributions centered on the actual weekly averages for the control group.
+muPre <- c(0.175, 0.119, 0.150, 0.116, 0.136, 0.127, 0.123, 0.124, 0.131, 0.127, 0.124, 0.121, 0.128, 0.129)
+
+for (i in 1:14) {
+  fakePre_df[[paste0("Week", i, "Score")]] <- round(rbinom(nPre, 100, muPre[i]) / 100, 3)
+}
+
+fakePre_df$Group <- "Pre"
+```
+
+## Simulate Post-Intervention Data
+
+```{r}
+nPost <- 500
+
+fakePost_df <- data.frame(
+  PersonID = sprintf("P%05d", sample(60000:99999, nPost, replace = TRUE)),
+  InstructorID = sample(paste0("I", sprintf("%03d", 1:50)), nPost, replace = TRUE)
+)
+
+# Synthetic weekly average predictive scores generated from 1,000 draws from binomial 
+# distributions centered on the actual weekly averages for the intervention group.
+muPost <- c(0.168, 0.134, 0.132, 0.118, 0.134, 0.137, 0.113, 0.125, 0.111, 0.139, 0.110, 0.107, 0.117, 0.116)
+
+for (i in 1:14) {
+  fakePost_df[[paste0("Week", i, "Score")]] <- round(rbinom(nPost, 100, muPost[i]) / 100, 3)
+}
+
+fakePost_df$Group <- "Post"
+```
+
+# Combine and Reshape
+
+```{r}
+fake_DT <- data.table(rbind(fakePre_df, fakePost_df))
+fake_DT$FirstWeekScore <- fake_DT$Week1Score
+
+fakelong_DT <- fake_DT %>%
+  pivot_longer(
+    cols = starts_with("Week"),
+    names_to = "week",
+    values_to = "risk_score"
+  ) %>%
+  mutate(
+    week = as.integer(gsub("Week([0-9]+)Score", "\\1", week)),
+    risk_score_adj = pmin(pmax(risk_score, 0.000001), 0.999999),
+    logit_risk = log(risk_score_adj / (1 - risk_score_adj)),
+    week_c = as.integer(week) - 1
+  )
+```
+
+# Fit Linear Mixed Effects Model
+
+```{r}
+fake_model <- lmer(
+  logit_risk ~ Group * ns(week_c, df = 4) + FirstWeekScore + (1 | PersonID) + (1 | InstructorID),
+  data = fakelong_DT
+)
+
+summary(fake_model)
+```
+
+# Predict and Back-transform
+
+```{r}
+fakepred_DT <- ggpredict(fake_model, terms = c("week_c [all]", "Group"))
+fakepred_DT$week <- fakepred_DT$x + 1
+
+inv_logit <- function(x) {
+  exp(x) / (1 + exp(x))
+}
+
+fakepred_DT$probability <- inv_logit(fakepred_DT$predicted)
+fakepred_DT$conf.low.prob <- pmax(0, inv_logit(fakepred_DT$conf.low)) - 0.003
+fakepred_DT$conf.high.prob <- pmin(1, inv_logit(fakepred_DT$conf.high)) + 0.003
+```
+
+# Plot Results
+
+```{r}
+fakepred_DT$group <- factor(fakepred_DT$group, levels = c("Pre", "Post"))
+fakelong_DT$Group <- factor(fakelong_DT$Group, levels = c("Pre", "Post"))
+
+ggplot(fakepred_DT, aes(x = week, y = probability, color = group)) +
+  geom_ribbon(aes(ymin = conf.low.prob, ymax = conf.high.prob, fill = group, group = group), alpha = 0.2, color = NA) +
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(values = c("Pre" = "steelblue", "Post" = "darkorange"),
+                     labels = c("Pre (Baseline)", "Post (Pilot)")) +
+  scale_fill_manual(values = c("Pre" = "steelblue", "Post" = "darkorange"),
+                    labels = c("Pre (Baseline)", "Post (Pilot)")) +
+  labs(
+    title = "Risk Score Trajectories by Group (Synthetic Data)",
+    x = "Week",
+    y = "Predicted Risk Score",
+    color = NULL,
+    fill = NULL
+  ) +
+  scale_x_continuous(breaks = seq(1, 14, by = 1)) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.05), limits = c(0, 0.17)) +
+  theme_minimal(base_size = 14)
+```
+
+# Likelihood Ratio Test
+
+```{r}
+fakepred_reduced <- lmer(
+  logit_risk ~ Group + ns(week, df = 4) + FirstWeekScore + (1 | PersonID) + (1 | InstructorID),
+  data = fakelong_DT
+)
+
+anova(fakepred_reduced, fake_model)
+```
